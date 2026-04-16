@@ -1,6 +1,6 @@
 # Claude Code Longrun Operation Examples
 
-## Example: Complete Parent + Sub-Agent Workflow
+## Example: Complete Parent + Operator Workflow
 
 ### Parent Agent Side
 
@@ -11,65 +11,63 @@ exec({ command: `tmux new-session -d -s ${SESSION_NAME}` });
 
 // 2. Write task file
 write({
-  path: "/root/.openclaw/workspace/scripts/task-ui-analysis.md",
+  path: "/path/to/task-analysis.md",
   content: `## Goal
-分析笔记系统的 UI 风格，给出优化建议。
+Analyze the UI style of the note-taking app and give improvement suggestions.
 
 ## Project Context
-- repo: /root/workspace/my_note
+- repo or directory: /path/to/project
 - files: public/views/index.html, public/css/style.css, public/js/app.js
 
 ## What to do
-1. 分析视觉风格和配色方案
-2. 分析布局设计
-3. 列出用户体验问题
-4. 给出具体优化建议
+1. Analyze visual style and color scheme
+2. Analyze layout design
+3. List UX problems
+4. Give specific improvement suggestions
 
 ## Deliverable
-汇报：UI 风格总结 + 主要问题 + 优化建议`
+Report: UI style summary + main issues + improvement suggestions`
 });
 
-// 3. Spawn sub-agent with the SESSION_NAME
+// 3. Spawn sub-agent — pass SESSION_NAME
 sessions_spawn({
   runtime: "subagent",
   mode: "run",
   task: `You are the OPERATOR for a Claude Code longrun task.
 
-CRITICAL: 
-- Do NOT create tmux sessions. One already exists.
-- Do NOT spawn more sub-agents.
-- Do NOT analyze code yourself.
-
-Tmux session name: ${SESSION_NAME}
+Tmux session: ${SESSION_NAME}
 
 1. Launch Claude Code:
-tmux send-keys -t ${SESSION_NAME} "cd /root/workspace/my_note && claude --permission-mode bypassPermissions" Enter
+tmux send-keys -t ${SESSION_NAME} "cd /path/to/project && claude --permission-mode bypassPermissions" Enter
 sleep 4
 
-2. Send the task:
-tmux send-keys -t ${SESSION_NAME} -l -- "$(cat /root/.openclaw/workspace/scripts/task-ui-analysis.md)"
+2. Tell Claude to read and execute the task file:
+tmux send-keys -t ${SESSION_NAME} -l -- "Read /path/to/task-analysis.md and execute it. If blocked, stop and ask one clear question."
 tmux send-keys -t ${SESSION_NAME} Enter
 
-3. Monitor (every 60s, up to 3 times):
-tmux capture-pane -t ${SESSION_NAME} -p | tail -60
-sleep 60
+3. Monitor — check tmux output every 2-5 minutes. Do NOT interrupt Claude if it is working.
 
-4. Collect final output:
+4. When Claude signals done or is blocked:
 tmux capture-pane -t ${SESSION_NAME} -p | tail -150
 
-5. Cleanup:
-tmux kill-session -t ${SESSION_NAME}
-
-6. Report results to parent.`
+5. Report to parent with:
+- 任务状态: ✅ 完成 / ⚠️ 阻塞 / 🚨 失败
+- tmux session: ${SESSION_NAME} (do NOT kill — preserve for follow-ups)
+- summary: [what happened]`
 });
 
 // 4. Yield
-sessions_yield({ message: "Claude Code 已启动，完成后会自动通知你。" });
+sessions_yield({ message: "Claude Code 已在 tmux 中启动，完成后会自动通知你。" });
 ```
 
 ### Operator Sub-Agent Side (spawned)
 
-The sub-agent receives the SESSION_NAME and executes the tmux commands listed above. It does NOT create the session, does NOT spawn further agents, and does NOT analyze code directly.
+Receives SESSION_NAME, then:
+1. Sends "claude --print" command to the existing tmux session
+2. Tells Claude to read the task file (NOT paste full contents)
+3. Monitors at low frequency (every 2-5 minutes)
+4. Makes workflow judgments — may intervene if Claude is stuck
+5. Reports results to parent, preserving the tmux session
 
 ---
 
@@ -84,37 +82,78 @@ Sub-agent sends "claude --print" command to session
        ↓
 Claude Code runs inside tmux (persists across turns)
        ↓
-Sub-agent polls tmux capture-pane periodically
+Sub-agent monitors at low frequency (2-5 min intervals)
        ↓
-Claude finishes → Sub-agent collects output
+Claude finishes OR signals blocked → Sub-agent collects output
        ↓
-Sub-agent kills session → Reports to parent
+tmux session PRESERVED for follow-up turns (NOT killed by default)
+       ↓
+Follow-up turns send new instructions into same session
 ```
 
 ---
 
-## Example: Continue Same Session (Follow-up)
+## Example: Follow-up Turn (Continue Same Session)
 
-When user says "继续" or "再改一下":
+When user says "继续", "再改一下", or "also add tests":
 
 ```bash
-# Find the session name from /root/.openclaw/workspace/scripts/
-ls /root/.openclaw/workspace/scripts/ | grep task-
+# Find the tmux session
+tmux list-sessions
 
-# Send follow-up command to existing session
-tmux send-keys -t <session-name> -l -- "继续修复 UI 问题，重点处理手绘风格统一和浮动动画"
+# Send follow-up instruction to the existing session
+tmux send-keys -t <session-name> -l -- "Continue fixing the UI issues. Add specific CSS improvements for the sidebar float animation."
+tmux send-keys -t <session-name> Enter
+
+# Monitor
+tmux capture-pane -t <session-name> -p | tail -60
+```
+
+The key benefit of tmux: Claude preserves context from the original task.
+
+---
+
+## Example: Claude is Blocked — Send Intervention
+
+If tmux output shows Claude is waiting for a decision:
+
+```bash
+tmux send-keys -t <session-name> -l -- "Use the existing color palette. Do not introduce new dependencies. Continue with the minimal fix."
 tmux send-keys -t <session-name> Enter
 ```
+
+---
 
 ## Example: Stop a Bad Run
 
 ```bash
+# Interrupt Claude
 tmux send-keys -t <session-name> C-c
+
+# Send corrected instruction OR kill session
 tmux kill-session -t <session-name>
 ```
 
-## Example: Tiny task (no tmux needed)
+---
+
+## Example: Task is Small — Use One-Shot Instead
+
+For tiny asks, do NOT use this skill:
 
 ```bash
-cd /root/workspace/my_note && claude --print '列出 public/css/style.css 中的所有颜色变量'
+cd /path/to/project && claude --print 'List the color variables in public/css/style.css'
 ```
+
+Use longrun only when persistence and follow-up context actually matter.
+
+---
+
+## Anti-Patterns (What NOT to Do)
+
+❌ Sub-agent creates tmux session itself → exec may fail in sub-agent context
+❌ Sub-agent spawns another sub-agent → infinite recursion loop
+❌ Operator does the analysis itself → undermines Claude Code's purpose
+❌ Kill tmux session after every task → destroys the one thing this skill preserves
+❌ Poll every 60 seconds → interrupts Claude's long-running work
+❌ Paste full task via tmux send-keys → fragile for long prompts
+❌ Hard-code paths like /root/.openclaw/... → not portable across environments

@@ -1,119 +1,159 @@
 # Claude Code Longrun Operation Examples
 
-These are practical patterns for running Claude Code as a persistent tmux-backed worker.
+## Example: Complete Parent + Operator Workflow
 
-## Example 1: Start a long task from scratch
+### Parent Agent Side
 
-Use when the user asks Claude Code to handle a large coding task in a real repo.
+```javascript
+// 1. Create tmux session FIRST (before spawning sub-agent)
+const SESSION_NAME = "claude-" + Date.now();
+exec({ command: `tmux new-session -d -s ${SESSION_NAME}` });
 
-```bash
-PROJECT=~/projects/my-repo
-SESSION=claude-my-repo-auth
-TASK_DIR="$PROJECT/.openclaw-tasks"
-TASK_FILE="$TASK_DIR/auth-fix.md"
-
-mkdir -p "$TASK_DIR"
-cat > "$TASK_FILE" <<'EOF'
-## Goal
-Fix the auth refresh flow bug without changing unrelated login behavior.
+// 2. Write task file
+write({
+  path: "/path/to/task-analysis.md",
+  content: `## Goal
+Analyze the UI style of the note-taking app and give improvement suggestions.
 
 ## Project Context
-- repo: ~/projects/my-repo
-- inspect auth middleware, refresh token handling, and API client retry path first
-
-## Constraints
-- keep changes minimal
-- do not change public API contracts
-- run targeted tests if available
+- repo or directory: /path/to/project
+- files: public/views/index.html, public/css/style.css, public/js/app.js
 
 ## What to do
-1. Trace the current refresh flow.
-2. Find the actual cause of the bug.
-3. Implement the smallest safe fix.
-4. Run relevant validation.
-5. Summarize files changed, commands run, and remaining risks.
-EOF
+1. Analyze visual style and color scheme
+2. Analyze layout design
+3. List UX problems
+4. Give specific improvement suggestions
 
-tmux new-session -d -s "$SESSION"
-tmux send-keys -t "$SESSION" "cd '$PROJECT' && claude --permission-mode bypassPermissions" Enter
-sleep 2
+## Deliverable
+Report: UI style summary + main issues + improvement suggestions`
+});
 
-tmux send-keys -t "$SESSION" -l -- "Read ./.openclaw-tasks/auth-fix.md and execute it. If blocked, stop and ask one clear question."
-sleep 0.1
-tmux send-keys -t "$SESSION" Enter
+// 3. Spawn sub-agent — pass SESSION_NAME
+sessions_spawn({
+  runtime: "subagent",
+  mode: "run",
+  task: `You are the OPERATOR for a Claude Code longrun task.
+
+Tmux session: ${SESSION_NAME}
+
+1. Launch Claude Code:
+tmux send-keys -t ${SESSION_NAME} "cd /path/to/project && claude --permission-mode bypassPermissions" Enter
+sleep 4
+
+2. Tell Claude to read and execute the task file:
+tmux send-keys -t ${SESSION_NAME} -l -- "Read /path/to/task-analysis.md and execute it. If blocked, stop and ask one clear question."
+tmux send-keys -t ${SESSION_NAME} Enter
+
+3. Monitor — check tmux output every 2-5 minutes. Do NOT interrupt Claude if it is working.
+
+4. When Claude signals done or is blocked:
+tmux capture-pane -t ${SESSION_NAME} -p | tail -150
+
+5. Report to parent with:
+- 任务状态: ✅ 完成 / ⚠️ 阻塞 / 🚨 失败
+- tmux session: ${SESSION_NAME} (do NOT kill — preserve for follow-ups)
+- summary: [what happened]`
+});
+
+// 4. Yield
+sessions_yield({ message: "Claude Code 已在 tmux 中启动，完成后会自动通知你。" });
 ```
 
-## Example 2: Poll without over-interrupting
+### Operator Sub-Agent Side (spawned)
 
-Use when the task is already running and you only want to check progress.
+Receives SESSION_NAME, then:
+1. Sends "claude --print" command to the existing tmux session
+2. Tells Claude to read the task file (NOT paste full contents)
+3. Monitors at low frequency (every 2-5 minutes)
+4. Makes workflow judgments — may intervene if Claude is stuck
+5. Reports results to parent, preserving the tmux session
+
+---
+
+## tmux Session Lifecycle
+
+```
+Parent creates session
+       ↓
+Parent spawns sub-agent (passes SESSION_NAME)
+       ↓
+Sub-agent sends "claude --print" command to session
+       ↓
+Claude Code runs inside tmux (persists across turns)
+       ↓
+Sub-agent monitors at low frequency (2-5 min intervals)
+       ↓
+Claude finishes OR signals blocked → Sub-agent collects output
+       ↓
+tmux session PRESERVED for follow-up turns (NOT killed by default)
+       ↓
+Follow-up turns send new instructions into same session
+```
+
+---
+
+## Example: Follow-up Turn (Continue Same Session)
+
+When user says "继续", "再改一下", or "also add tests":
 
 ```bash
-SESSION=claude-my-repo-auth
+# Find the tmux session
+tmux list-sessions
 
-tmux capture-pane -t "$SESSION" -p | tail -40
+# Send follow-up instruction to the existing session
+tmux send-keys -t <session-name> -l -- "Continue fixing the UI issues. Add specific CSS improvements for the sidebar float animation."
+tmux send-keys -t <session-name> Enter
+
+# Monitor
+tmux capture-pane -t <session-name> -p | tail -60
 ```
 
-If Claude is actively investigating, editing, or testing, leave it alone.
+The key benefit of tmux: Claude preserves context from the original task.
 
-A good default is to check roughly every 5 minutes for longer tasks.
+---
 
-## Example 3: Claude is blocked and needs input
+## Example: Claude is Blocked — Send Intervention
 
-If output shows a question or a request for a decision, send one compact instruction back.
+If tmux output shows Claude is waiting for a decision:
 
 ```bash
-SESSION=claude-my-repo-auth
-
-tmux send-keys -t "$SESSION" -l -- "Use the existing retry contract. Do not introduce a new config flag. Continue with the minimal fix."
-sleep 0.1
-tmux send-keys -t "$SESSION" Enter
+tmux send-keys -t <session-name> -l -- "Use the existing color palette. Do not introduce new dependencies. Continue with the minimal fix."
+tmux send-keys -t <session-name> Enter
 ```
 
-## Example 4: Continue the same session in a follow-up turn
+---
 
-Use when the user says something like “继续”, “顺手把测试也补了”, or “再把日志整理一下”.
+## Example: Stop a Bad Run
 
 ```bash
-SESSION=claude-my-repo-auth
+# Interrupt Claude
+tmux send-keys -t <session-name> C-c
 
-tmux send-keys -t "$SESSION" -l -- "Continue in the same branch. Add or update targeted tests for the refresh flow, then summarize what changed."
-sleep 0.1
-tmux send-keys -t "$SESSION" Enter
+# Send corrected instruction OR kill session
+tmux kill-session -t <session-name>
 ```
 
-This is the main reason to prefer tmux over a one-shot `claude --print` flow.
+---
 
-## Example 5: Inspect full scrollback when recent output is not enough
+## Example: Task is Small — Use One-Shot Instead
+
+For tiny asks, do NOT use this skill:
 
 ```bash
-SESSION=claude-my-repo-auth
-
-tmux capture-pane -t "$SESSION" -p -S -
+cd /path/to/project && claude --print 'List the color variables in public/css/style.css'
 ```
 
-Use this sparingly. Usually the last 30 to 60 lines are enough.
+Use longrun only when persistence and follow-up context actually matter.
 
-## Example 6: Stop a clearly bad run
+---
 
-Only do this when Claude is truly stuck, looping, or working on the wrong thing.
+## Anti-Patterns (What NOT to Do)
 
-```bash
-SESSION=claude-my-repo-auth
-
-tmux send-keys -t "$SESSION" C-c
-```
-
-Then either:
-
-- send a corrected instruction into the same session, or
-- start a fresh session if the current context is too polluted
-
-## Example 7: Tiny task, do not use tmux
-
-For a narrow one-shot ask, use `claude --print` instead.
-
-```bash
-cd ~/projects/my-repo && claude --permission-mode bypassPermissions --print 'Explain where the refresh token is validated and list the relevant files.'
-```
-
-Use the longrun skill only when persistence and follow-up context actually matter.
+❌ Sub-agent creates tmux session itself → exec may fail in sub-agent context
+❌ Sub-agent spawns another sub-agent → infinite recursion loop
+❌ Operator does the analysis itself → undermines Claude Code's purpose
+❌ Kill tmux session after every task → destroys the one thing this skill preserves
+❌ Poll every 60 seconds → interrupts Claude's long-running work
+❌ Paste full task via tmux send-keys → fragile for long prompts
+❌ Hard-code paths like /root/.openclaw/... → not portable across environments

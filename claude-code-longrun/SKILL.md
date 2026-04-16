@@ -1,206 +1,207 @@
 ---
 name: claude-code-longrun
-description: Use for Claude Code tasks that are long-running, iterative, or need persistent context across multiple rounds. Trigger when the user asks to use Claude Code for a complex coding task, wants tmux-based persistence, wants to reuse Claude Code context between follow-ups, or when a one-shot `claude --print` flow would likely lose too much context. Prefer this over generic coding-agent guidance for Claude Code sessions expected to run for many minutes or across multiple interactions.
+description: Use for Claude Code tasks that are long-running, iterative, or need persistent context across multiple rounds. Trigger when the user asks to use Claude Code for a complex coding task, wants tmux-based persistence, wants to reuse Claude Code context between follow-ups, or when a one-shot `claude --print` flow would would likely lose too much context. Prefer this over generic coding-agent guidance for Claude Code sessions expected to run for many minutes or across multiple interactions.
 ---
 
 # Claude Code Longrun
 
 Use this skill when **Claude Code** is the requested tool and the task is too large, too iterative, or too context-heavy for a one-shot `claude --print` call.
 
-## Use this skill when
+## Decision Guide
 
-- The user explicitly wants **Claude Code**.
-- The task is expected to run for many minutes.
-- You will likely send follow-up instructions into the **same Claude Code session**.
-- The prompt is long enough that putting it directly on the command line is awkward.
-- The job benefits from persistent working context, scratch notes, or multiple review/fix rounds.
+Not every coding task needs tmux. Here's when to use which:
 
-## Do not use this skill when
+| Situation | Approach |
+|-----------|----------|
+| Narrow, one-off ask | `claude --print` directly |
+| Simple local edit you can do | Use native tools directly |
+| Complex/long task, no follow-up | `claude --print` with task file |
+| Complex task + likely follow-ups ("继续", "再改一下") | **This skill** — tmux-backed session |
+| ACP harness thread request | `sessions_spawn` with `runtime:"acp"` instead |
 
-- The task is tiny and can finish in one `claude --print` call.
-- The user asked for Codex, Pi, ACP harness, or another tool.
-- The work is a simple local edit you can do directly.
-- The work must happen in a Discord thread via ACP harness. In that case use `sessions_spawn` with `runtime:"acp"`.
+**Use this skill when:**
+- The user explicitly wants **Claude Code**
+- The task is expected to run for many minutes
+- You will likely send follow-up instructions into the **same Claude Code session**
+- The job benefits from persistent working context across review/fix cycles
 
-## Core rule
+**Do NOT use this skill when:**
+- The task is tiny and can finish in one `claude --print` call
+- The user asked for Codex, Pi, or ACP harness
+- The work must happen in a Discord thread (use `sessions_spawn` with `runtime:"acp"`)
 
-For **Claude Code long tasks**, prefer:
+---
 
-1. **tmux session** for persistence
-2. **task file** for long instructions
-3. **low-frequency monitoring** instead of frequent interruption
+# TWO-AGENT ARCHITECTURE
 
-Avoid treating Claude Code like a fire-and-forget one-shot when the user actually wants a continuing working session.
+| Agent | Role |
+|-------|------|
+| **Parent agent** (you) | Create tmux session, write task file, spawn operator sub-agent |
+| **Operator sub-agent** | Send task to Claude Code via tmux, monitor, make workflow judgments |
 
-## Why
+**Design goals:**
+- Parent creates infrastructure (tmux session) before spawning — avoids sub-agent exec failures
+- Sub-agent does NOT spawn further sub-agents — prevents recursive spawning loops
+- Sub-agent may make workflow judgments (is Claude blocked? should I intervene?) but must not independently complete the main task — Claude Code does the actual work
+- tmux session is preserved by default — follow-up turns reuse the same session
 
-`claude --print` is fine for short tasks, but it is not the best default when:
+---
 
-- you want to preserve context across multiple turns,
-- the prompt is long,
-- the task may branch into investigation, edits, tests, and fixes,
-- or the user will probably say “继续”, “再改一下”, “顺手把这个也做了”.
+# Phase 1: Parent Agent Workflow
 
-The failure mode is usually **over-interrupting too early**, not Claude Code being unable to handle the work.
-
-## Preferred workflow
-
-### 1. Start a dedicated tmux session
-
-Use a clear session name related to the task.
-
-Example:
-
-```bash
-tmux new-session -d -s claude-auth-fix
-```
-
-If the project directory matters, start Claude from the correct working directory.
-
-### 2. Write a task file
-
-Do not stuff a long brief directly into shell quoting if you can avoid it.
-
-Create a task file inside the target project or a temp path, for example:
-
-- `./.openclaw-tasks/claude-task.md`
-- `/tmp/claude-task-<slug>.md`
-
-The task file should include:
-
-- the user goal
-- scope boundaries
-- constraints
-- repo/path context
-- required checks or tests
-- expected final output format
-
-Keep task files free of unnecessary secrets. Prefer describing required credentials or environment assumptions instead of pasting tokens, private keys, or personal data.
-
-See `references/task-file-template.md` for a reusable structure.
-
-### 3. Launch Claude Code inside tmux
-
-Preferred pattern:
+### Step 1: Create tmux session
 
 ```bash
-cd /path/to/project && claude --permission-mode bypassPermissions
+SESSION_NAME="claude-$(date +%s)"
+tmux new-session -d -s "$SESSION_NAME"
 ```
 
-Then send Claude a short instruction telling it to read the task file and execute from there.
+Save `$SESSION_NAME` — you'll pass it to the sub-agent.
 
-Example instruction sent into tmux:
+### Step 2: Write the task file
 
-```text
-Read ./.openclaw-tasks/claude-task.md, follow it exactly, keep notes concise, and tell me when you are blocked or fully done.
+```javascript
+write({
+  path: "/path/to/task-[shortname].md",
+  content: `## Goal
+[One sentence describing the end result]
+
+## Project Context
+- repo or directory: [path]
+- relevant files: [list]
+
+## Constraints
+- [any limitations]
+
+## What to do
+1. [concrete steps]
+
+## Deliverable
+[Summarize what to report back]`
+});
 ```
 
-## Monitoring strategy
+### Step 3: Spawn the operator sub-agent
 
-### Default
+```javascript
+sessions_spawn({
+  runtime: "subagent",
+  mode: "run",
+  task: `You are the OPERATOR for a Claude Code longrun task.
 
-Check output with `tmux capture-pane` at **low frequency**.
+Tmux session: ${SESSION_NAME}
+Project directory: [path/to/project]
 
-Good default cadence:
+1. Launch Claude Code:
+tmux send-keys -t ${SESSION_NAME} "cd [PROJECT_DIR] && claude --permission-mode bypassPermissions" Enter
+sleep 4
 
-- first check after a short settling period
-- then about every **5 minutes** for long tasks
-- faster only when the agent is clearly waiting for input
+2. Tell Claude to read and execute the task file:
+tmux send-keys -t ${SESSION_NAME} -l -- "Read /path/to/task-[shortname].md and execute it. If blocked, stop and ask one clear question."
+tmux send-keys -t ${SESSION_NAME} Enter
 
-### Do
+3. Monitor — check tmux output every 2-5 minutes. Do NOT interrupt Claude if it is actively working.
 
-- capture recent output
-- look for explicit questions, blockers, test failures, or completion
-- let Claude continue if it is clearly making progress
+4. When Claude signals done or is blocked, collect output:
+tmux capture-pane -t ${SESSION_NAME} -p | tail -150
 
-### Do not
-
-- interrupt just because output paused briefly
-- resend the task repeatedly
-- kill and restart a healthy run too early
-
-## Interaction pattern
-
-Use tmux as the persistent shell, not as a chat transcript viewer.
-
-Typical loop:
-
-1. create tmux session
-2. launch Claude Code in project dir
-3. write task file
-4. send a short “read this task file” instruction
-5. capture output occasionally
-6. only intervene if Claude asks for input, stalls clearly, or finishes
-
-## Recommended command patterns
-
-### Start session
-
-```bash
-tmux new-session -d -s <session-name>
+5. Report:
+- 任务状态: ✅ 完成 / ⚠️ 阻塞 / 🚨 失败
+- tmux session: ${SESSION_NAME} (preserve it — do NOT kill)
+- summary: [what happened]`
+});
 ```
 
-### Start Claude inside that session
+### Step 4: Yield
 
-```bash
-tmux send-keys -t <session-name> 'cd /path/to/project && claude --permission-mode bypassPermissions' Enter
+```javascript
+sessions_yield({ message: "Claude Code 已在 tmux 中启动，完成后会自动通知你。" });
 ```
 
-### Send the task instruction safely
+---
 
-```bash
-tmux send-keys -t <session-name> -l -- 'Read ./.openclaw-tasks/claude-task.md and execute it. If blocked, say exactly what you need.'
-sleep 0.1
-tmux send-keys -t <session-name> Enter
-```
+# Phase 2: Operator Sub-Agent Workflow
 
-### Check recent output
+**Role**: Operator — launch Claude Code, monitor, make workflow decisions. Claude Code does the actual work.
 
-```bash
-tmux capture-pane -t <session-name> -p | tail -40
-```
+**Operator rules:**
+- ✅ Send task instructions to Claude via tmux
+- ✅ Make workflow judgments (is Claude blocked? has it gone off track?)
+- ✅ Send corrective instructions when Claude is stuck
+- ✅ Report results to parent
+- ❌ Do NOT analyze the code or complete the main task yourself
+- ❌ Do NOT create tmux sessions (parent creates them)
+- ❌ Do NOT spawn more sub-agents
 
-### Check entire scrollback when needed
+### Monitoring guidance
 
-```bash
-tmux capture-pane -t <session-name> -p -S -
-```
+**Low-frequency monitoring is correct behavior.** For genuinely long-running tasks, over-monitoring is worse than under-monitoring.
 
-## Decision guide
+Default cadence:
+1. First check after Claude has had a few seconds to start (2-5s settling)
+2. Then check every **2-5 minutes** — not every 60 seconds
+3. Only intervene when Claude is clearly blocked, stuck, or asking a question
 
-### Use one-shot `claude --print` when
+Signs Claude is working well:
+- Output shows investigation, editing, running commands
+- Progress is being made
 
-- the ask is narrow
-- no persistent context is needed
-- a single response is likely enough
+Signs you should intervene:
+- Claude is asking a clear question that needs a decision
+- Claude has gone quiet for an unusually long time (>10 min on a complex task)
+- Claude is clearly stuck in a loop
 
-### Use this skill when
+### Session preservation
 
-- the ask is open-ended or investigative
-- the user is likely to iterate on Claude's work
-- you expect code, test, revise, and re-run cycles
-- preserving Claude's local context is part of the value
+**Do NOT kill the tmux session by default.** The session persists so follow-up turns ("继续", "再改一下", "add tests") can send new instructions into the same Claude Code context.
 
-## Output expectations
+Only kill the session when:
+- The task is fully complete and no follow-ups are expected
+- Claude has been stuck and you need to start fresh
+- The parent explicitly requests cleanup
 
-When using this skill, keep the human updated only when something meaningful changes:
+---
 
-- started and where it is running
-- blocked and what input is needed
-- milestone reached
-- finished with concrete results
+# tmux Cheat Sheet
 
-Do not spam the user with minor polling updates.
+| Command | Purpose |
+|---------|---------|
+| `tmux new-session -d -s <name>` | Create detached session |
+| `tmux send-keys -t <name> -l -- "text"` | Send text to session |
+| `tmux send-keys -t <name> Enter` | Press Enter |
+| `tmux capture-pane -t <name> -p` | Read session output |
+| `tmux capture-pane -t <name> -p \| tail -40` | Last 40 lines |
+| `tmux capture-pane -t <name> -p \| tail -150` | Last 150 lines (for final report) |
+| `tmux kill-session -t <name>` | Stop session |
+| `tmux list-sessions` | Show all sessions |
 
-## Common pitfalls
+---
 
-- Starting Claude with a huge inline prompt instead of a task file
-- Polling too often and mistaking quiet work for failure
-- Forgetting to run from the correct project directory
-- Using this pattern for tiny tasks that should have been one-shot
-- Embedding local machine assumptions or private workflow details that make the skill less portable
+# Common Pitfalls
 
-## References
+| Pitfall | Why it's bad | Prevention |
+|---------|-------------|------------|
+| Sub-agent creates tmux session | Exec may fail or behave unexpectedly in sub-agent context | Parent creates session before spawning |
+| Recursive sub-agent spawning | Sub-agent spawns another sub-agent → infinite loop | Operator is explicitly final — no further spawning |
+| Operator completes task itself | Undermines the whole point of using Claude Code | Operator sends to Claude, Claude does the work |
+| Over-monitoring (polling every 60s) | Interrupts Claude's work, wastes resources | Check every 2-5 minutes |
+| Default session teardown | Kills the one thing this skill is designed to preserve | Session cleanup is conditional, not default |
+| Hard-coded environment paths | Makes skill non-portable | Examples use [path] / [PROJECT_DIR] placeholders |
+| Pasting full task via tmux send-keys | Noisy and fragile for long prompts | Claude reads the task file directly |
+
+---
+
+# Why tmux?
+
+`claude --print` loses context between calls. tmux keeps Claude Code alive so:
+- Context persists across "continue" requests
+- Claude can run long investigations without timeout
+- You can send follow-up commands into the same session
+- Multiple review/fix cycles keep their context
+
+---
+
+# References
 
 - Task file template: `references/task-file-template.md`
 - Operation examples: `references/operation-examples.md`
